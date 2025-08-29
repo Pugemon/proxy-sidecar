@@ -1,0 +1,142 @@
+# Docker Transparent Proxy Sidecar
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+## Overview
+
+A configurable sidecar container for Docker designed to transparently proxy all outgoing TCP traffic from an adjacent application container. This project is intended for applications that do not natively support or respect standard proxy environment variables (e.g., `http_proxy`).
+
+The solution operates at the network level, requiring no modification to the target application.
+
+## How It Works
+
+The sidecar pattern is implemented using a combination of Docker networking features and internal traffic redirection utilities:
+
+1.  **Shared Network Stack:** The primary application container is configured with `network_mode: "service:<sidecar_name>"`. This instructs Docker to place the application container within the network namespace of the sidecar container, effectively inheriting its entire network stack.
+
+2.  **`iptables` Redirection:** On startup, the sidecar container utilizes `iptables` to create rules that intercept all outgoing TCP traffic originating from within its network namespace.
+
+3.  **`redsocks` Proxying:** The intercepted traffic is redirected to a local `redsocks` process running inside the sidecar. `redsocks` then forwards the traffic to the user-defined upstream proxy, handling the necessary protocol translation (e.g., to SOCKS5 or HTTP Connect).
+
+## Features
+
+*   **Transparent Operation:** The target application requires no proxy-specific configuration.
+*   **Environment-based Configuration:** All settings are controlled via Docker environment variables for maximum portability.
+*   **Multiple Proxy Protocol Support:** Compatible with `SOCKS5`, `SOCKS4`, and `HTTP` proxies.
+*   **Proxy Authentication Support:** Supports username and password authentication for the upstream proxy.
+*   **Network Exclusion Rules:** Allows specific CIDR ranges (such as other Docker networks) to bypass the proxy for direct communication.
+
+## Usage Guide
+
+### Step 1: Build the Docker Image
+
+It is recommended to build the image from the source and tag it for your own registry (e.g., Docker Hub).
+
+```bash
+# Clone the repository
+git clone https://github.com/Pugemon/docker-proxy-sidecar.git
+cd docker-proxy-sidecar
+
+# Build the image
+docker build -t your-username/proxy-sidecar:1.0 .
+
+# (Optional) Push the image to a container registry
+docker push your-username/proxy-sidecar:1.0
+```
+
+### Step 2: Configure `docker-compose.yml`
+
+Integrate the sidecar into your `docker-compose.yml` file. The configuration involves adding the `proxy` service and modifying your application's service definition.
+
+## Configuration
+
+The sidecar is configured via the following environment variables passed to its container.
+
+| Variable       | Required | Default  | Description                                                                                          |
+|:---------------|:---------|:---------|:-----------------------------------------------------------------------------------------------------|
+| `PROXY_HOST`   | **Yes**  | -        | The IP address or hostname of the upstream proxy server.                                             |
+| `PROXY_PORT`   | **Yes**  | -        | The port of the upstream proxy server.                                                               |
+| `PROXY_TYPE`   | No       | `socks5` | The proxy protocol. Valid options: `socks5`, `socks4`, `http-connect`, `http-relay`.                 |
+| `PROXY_USER`   | No       | -        | The username for proxy authentication, if required.                                                  |
+| `PROXY_PASS`   | No       | -        | The password for proxy authentication, if required.                                                  |
+| `EXCLUDE_CIDR` | No       | -        | A comma-separated list of CIDR ranges to exclude from proxying (e.g., `172.20.0.0/16,10.10.0.0/24`). |
+
+### Example `docker-compose.yml`
+
+This example demonstrates proxying an `n8n` container while allowing it to communicate directly with another Docker network (`supabase_default`).
+
+```yaml
+version: "3.8"
+
+services:
+  # The transparent proxy sidecar service
+  proxy:
+    image: your-username/proxy-sidecar:1.0
+    container_name: proxy_sidecar
+    cap_add:
+      - NET_ADMIN # Required to manipulate the container's network rules
+    ports:
+      # Ports for the main application must be published on the sidecar
+      - "5678:5678"
+    restart: unless-stopped
+    networks:
+      # The sidecar must be connected to any networks the main app needs to access directly
+      - supabase_default
+    environment:
+      # --- Sidecar Configuration ---
+      - PROXY_HOST=10.10.100.105
+      - PROXY_PORT=20171
+      - PROXY_TYPE=http-connect
+      - EXCLUDE_CIDR=172.20.0.0/16 # CIDR for the 'supabase_default' network
+
+  # The main application service
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n-main
+    restart: always
+    # Inherit the network stack from the 'proxy' service
+    network_mode: "service:proxy"
+    depends_on:
+      - proxy
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+
+networks:
+  supabase_default:
+    external: true
+```
+
+### Configuring Network Exclusions
+
+To enable direct communication between your application and other services on the Docker host (e.g., a database container), you must add that service's network CIDR to `EXCLUDE_CIDR`.
+
+1.  Identify the name of the Docker network the other service uses (e.g., `supabase_default`).
+2.  Inspect the network using the Docker CLI to find its subnet:
+
+    ```bash
+    docker network inspect supabase_default
+    ```
+
+3.  Locate the `"Subnet"` value within the `"IPAM"` configuration block.
+
+    ```json
+    [
+        {
+            "IPAM": {
+                "Config": [
+                    {
+                        "Subnet": "172.20.0.0/16"
+                    }
+                ]
+            }
+        }
+    ]
+    ```
+4.  Use this value for the `EXCLUDE_CIDR` environment variable.
+
+## License
+
+This project is distributed under the MIT License. See the `LICENSE` file for more information.
